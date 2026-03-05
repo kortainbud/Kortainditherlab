@@ -12,6 +12,8 @@ export type DitherAlgorithm =
 
 export type ColorMode = 'mono' | 'duotone' | 'halftone' | 'grayscale' | 'thermal';
 
+export type PaletteSize = 2 | 3 | 4;
+
 export interface DitherSettings {
   enabled: boolean;
   algorithm: DitherAlgorithm;
@@ -19,6 +21,9 @@ export interface DitherSettings {
   colorMode: ColorMode;
   fgColor: string;
   bgColor: string;
+  paletteSize: PaletteSize;
+  midColor: string;
+  mid2Color: string;
 }
 
 const BAYER_2x2 = [[0, 2], [3, 1]];
@@ -68,7 +73,7 @@ const blueNoise64 = getBlueNoise(64);
 
 // Thermal palette - 9 stops from cold to hot
 const THERMAL_STOPS: [number, number, number][] = [
-  [10, 0, 40],     // deep cold
+  [10, 0, 40],
   [30, 0, 100],
   [90, 0, 160],
   [170, 20, 110],
@@ -76,7 +81,7 @@ const THERMAL_STOPS: [number, number, number][] = [
   [245, 130, 0],
   [255, 200, 20],
   [255, 250, 130],
-  [255, 255, 255],  // hot white
+  [255, 255, 255],
 ];
 
 function thermalColor(lum: number): [number, number, number] {
@@ -118,56 +123,100 @@ function getOrderedThreshold(algo: DitherAlgorithm, x: number, y: number): numbe
   }
 }
 
+// ─── Build sorted palette from settings ───
+
+type RGB = [number, number, number];
+
+/** Build palette sorted from darkest to brightest */
+function buildPalette(settings: DitherSettings): RGB[] {
+  const fg = hexToRgb(settings.fgColor);
+  const bg = hexToRgb(settings.bgColor);
+  const paletteSize = settings.paletteSize ?? 2;
+
+  if (paletteSize === 2) {
+    const colors = [bg, fg];
+    colors.sort((a, b) => getLuminance(...a) - getLuminance(...b));
+    return colors;
+  }
+
+  if (paletteSize === 3) {
+    const mid = hexToRgb(settings.midColor || '#888888');
+    const colors = [bg, mid, fg];
+    colors.sort((a, b) => getLuminance(...a) - getLuminance(...b));
+    return colors;
+  }
+
+  // paletteSize === 4
+  const mid = hexToRgb(settings.midColor || '#888888');
+  const mid2 = hexToRgb(settings.mid2Color || '#444444');
+  const colors = [bg, mid2, mid, fg];
+  colors.sort((a, b) => getLuminance(...a) - getLuminance(...b));
+  return colors;
+}
+
+/** Given a normalized value 0–1, pick the color from a palette */
+function samplePalette(palette: RGB[], t: number): RGB {
+  const n = palette.length;
+  if (n === 1) return palette[0];
+  const scaled = t * (n - 1);
+  const i = Math.floor(scaled);
+  const f = scaled - i;
+  const a = palette[Math.min(i, n - 1)];
+  const b = palette[Math.min(i + 1, n - 1)];
+  return [
+    Math.round(a[0] + (b[0] - a[0]) * f),
+    Math.round(a[1] + (b[1] - a[1]) * f),
+    Math.round(a[2] + (b[2] - a[2]) * f),
+  ];
+}
+
 // Multi-level dithering: quantize luminance into N levels using dither threshold
 function ditherQuantize(lum: number, threshold: number, levels: number): number {
   const step = 255 / (levels - 1);
   const base = Math.floor(lum / step);
-  const remainder = (lum - base * step) / step; // 0..1 fractional part
-  const t = threshold / 255; // normalize threshold to 0..1
+  const remainder = (lum - base * step) / step;
+  const t = threshold / 255;
   const quantized = remainder > t ? Math.min(base + 1, levels - 1) : base;
-  return (quantized * step);
+  return quantized * step;
 }
+
+// ─── Per-pixel color application ───
 
 function applyColorToPixel(
   out: Uint8ClampedArray,
   idx: number,
   lum: number,
   threshold: number,
-  fg: [number, number, number],
-  bg: [number, number, number],
-  mode: ColorMode
+  palette: RGB[],
+  mode: ColorMode,
 ) {
+  const n = palette.length; // number of palette colors
+
   switch (mode) {
-    case 'mono': {
-      const bright = lum > threshold;
-      const c = bright ? fg : bg;
+    case 'mono':
+    case 'halftone': {
+      // Binary threshold: pick nearest palette stop
+      const q = ditherQuantize(lum, threshold, n);
+      const c = samplePalette(palette, q / 255);
       out[idx] = c[0]; out[idx + 1] = c[1]; out[idx + 2] = c[2];
       break;
     }
     case 'duotone': {
-      // Dithered duotone: quantize to 4 levels between fg and bg
-      const q = ditherQuantize(lum, threshold, 4) / 255;
-      out[idx] = Math.round(bg[0] + (fg[0] - bg[0]) * q);
-      out[idx + 1] = Math.round(bg[1] + (fg[1] - bg[1]) * q);
-      out[idx + 2] = Math.round(bg[2] + (fg[2] - bg[2]) * q);
-      break;
-    }
-    case 'halftone': {
-      const bright = lum > threshold;
-      const c = bright ? fg : bg;
+      // Smooth quantized dithering across palette
+      const levels = Math.max(n, 4);
+      const q = ditherQuantize(lum, threshold, levels) / 255;
+      const c = samplePalette(palette, q);
       out[idx] = c[0]; out[idx + 1] = c[1]; out[idx + 2] = c[2];
       break;
     }
     case 'grayscale': {
-      // Dithered grayscale: quantize to 5 gray levels between bg and fg
-      const q = ditherQuantize(lum, threshold, 5) / 255;
-      out[idx] = Math.round(bg[0] + (fg[0] - bg[0]) * q);
-      out[idx + 1] = Math.round(bg[1] + (fg[1] - bg[1]) * q);
-      out[idx + 2] = Math.round(bg[2] + (fg[2] - bg[2]) * q);
+      const levels = Math.max(n, 5);
+      const q = ditherQuantize(lum, threshold, levels) / 255;
+      const c = samplePalette(palette, q);
+      out[idx] = c[0]; out[idx + 1] = c[1]; out[idx + 2] = c[2];
       break;
     }
     case 'thermal': {
-      // Dithered thermal: quantize luminance then map to thermal palette
       const q = ditherQuantize(lum, threshold, 6);
       const tc = thermalColor(q);
       out[idx] = tc[0]; out[idx + 1] = tc[1]; out[idx + 2] = tc[2];
@@ -176,6 +225,41 @@ function applyColorToPixel(
   }
   out[idx + 3] = 255;
 }
+
+// For error-diffusion: value is already quantized
+function applyColorToPixelErrorDiffusion(
+  out: Uint8ClampedArray,
+  idx: number,
+  quantizedLum: number,
+  palette: RGB[],
+  mode: ColorMode,
+) {
+  const t = Math.max(0, Math.min(1, quantizedLum / 255));
+
+  switch (mode) {
+    case 'mono':
+    case 'halftone': {
+      // Snap to nearest palette color
+      const c = samplePalette(palette, t);
+      out[idx] = c[0]; out[idx + 1] = c[1]; out[idx + 2] = c[2];
+      break;
+    }
+    case 'duotone':
+    case 'grayscale': {
+      const c = samplePalette(palette, t);
+      out[idx] = c[0]; out[idx + 1] = c[1]; out[idx + 2] = c[2];
+      break;
+    }
+    case 'thermal': {
+      const tc = thermalColor(quantizedLum);
+      out[idx] = tc[0]; out[idx + 1] = tc[1]; out[idx + 2] = tc[2];
+      break;
+    }
+  }
+  out[idx + 3] = 255;
+}
+
+// ─── Main dithering entry point ───
 
 export function applyDithering(
   imageData: ImageData,
@@ -186,8 +270,7 @@ export function applyDithering(
   const src = new Uint8ClampedArray(imageData.data);
   const result = new ImageData(new Uint8ClampedArray(src.length), width, height);
   const out = result.data;
-  const fg = hexToRgb(settings.fgColor);
-  const bg = hexToRgb(settings.bgColor);
+  const palette = buildPalette(settings);
   const scale = Math.max(1, settings.pixelScale);
 
   // Pixelate
@@ -213,6 +296,7 @@ export function applyDithering(
   }
 
   const algo = settings.algorithm;
+  const n = palette.length;
 
   // Error diffusion
   if (algo === 'floyd-steinberg' || algo === 'atkinson') {
@@ -222,11 +306,12 @@ export function applyDithering(
       errors[i] = getLuminance(src[idx], src[idx + 1], src[idx + 2]);
     }
 
-    // Determine quantization levels based on color mode
-    const levels = settings.colorMode === 'mono' || settings.colorMode === 'halftone' ? 2
-      : settings.colorMode === 'duotone' ? 4
-      : settings.colorMode === 'grayscale' ? 5
-      : 6; // thermal
+    // Quantization levels: palette size for mono/halftone, more for smoother modes
+    const levels = settings.colorMode === 'mono' || settings.colorMode === 'halftone'
+      ? n
+      : settings.colorMode === 'thermal'
+        ? 6
+        : Math.max(n + 1, settings.colorMode === 'grayscale' ? 5 : 4);
 
     const step = 255 / (levels - 1);
 
@@ -234,7 +319,6 @@ export function applyDithering(
       for (let x = 0; x < width; x++) {
         const i = y * width + x;
         const oldVal = Math.max(0, Math.min(255, errors[i]));
-        // Quantize to nearest level
         const newVal = Math.round(oldVal / step) * step;
         const error = oldVal - newVal;
         errors[i] = newVal;
@@ -262,9 +346,7 @@ export function applyDithering(
 
     for (let i = 0; i < width * height; i++) {
       const idx = i * 4;
-      const quantized = errors[i];
-      // Use quantized value as the luminance for color mapping
-      applyColorToPixelErrorDiffusion(out, idx, quantized, fg, bg, settings.colorMode);
+      applyColorToPixelErrorDiffusion(out, idx, errors[i], palette, settings.colorMode);
     }
   } else {
     // Ordered dithering
@@ -273,43 +355,10 @@ export function applyDithering(
         const idx = (y * width + x) * 4;
         const lum = getLuminance(src[idx], src[idx + 1], src[idx + 2]);
         const threshold = getOrderedThreshold(algo, x, y);
-        applyColorToPixel(out, idx, lum, threshold, fg, bg, settings.colorMode);
+        applyColorToPixel(out, idx, lum, threshold, palette, settings.colorMode);
       }
     }
   }
 
   return result;
-}
-
-// For error-diffusion: value is already quantized
-function applyColorToPixelErrorDiffusion(
-  out: Uint8ClampedArray,
-  idx: number,
-  quantizedLum: number,
-  fg: [number, number, number],
-  bg: [number, number, number],
-  mode: ColorMode
-) {
-  const t = Math.max(0, Math.min(1, quantizedLum / 255));
-  switch (mode) {
-    case 'mono':
-    case 'halftone': {
-      const c = t > 0.5 ? fg : bg;
-      out[idx] = c[0]; out[idx + 1] = c[1]; out[idx + 2] = c[2];
-      break;
-    }
-    case 'duotone':
-    case 'grayscale': {
-      out[idx] = Math.round(bg[0] + (fg[0] - bg[0]) * t);
-      out[idx + 1] = Math.round(bg[1] + (fg[1] - bg[1]) * t);
-      out[idx + 2] = Math.round(bg[2] + (fg[2] - bg[2]) * t);
-      break;
-    }
-    case 'thermal': {
-      const tc = thermalColor(quantizedLum);
-      out[idx] = tc[0]; out[idx + 1] = tc[1]; out[idx + 2] = tc[2];
-      break;
-    }
-  }
-  out[idx + 3] = 255;
 }

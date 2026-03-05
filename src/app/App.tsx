@@ -15,6 +15,9 @@ const defaultDitherSettings: DitherSettings = {
   colorMode: 'mono',
   fgColor: '#ffffff',
   bgColor: '#000000',
+  paletteSize: 2,
+  midColor: '#888888',
+  mid2Color: '#444444',
 };
 
 export default function App() {
@@ -153,6 +156,10 @@ export default function App() {
           <span className="text-[#111]">·</span>
           <span className="text-[8px] text-[#1f1f1f] uppercase tracking-[0.12em]">
             {ditherSettings.colorMode}
+          </span>
+          <span className="text-[#111]">·</span>
+          <span className="text-[8px] text-[#1f1f1f] uppercase tracking-[0.12em]">
+            {ditherSettings.colorMode !== 'thermal' ? `${ditherSettings.paletteSize} col` : 'thermal'}
           </span>
           <span className="text-[#111]">·</span>
           <span className="text-[8px] text-[#1f1f1f] uppercase tracking-[0.12em]">

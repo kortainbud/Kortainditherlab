@@ -1,5 +1,5 @@
 import React, { useCallback } from 'react';
-import { DitherAlgorithm, DitherSettings, ColorMode } from './dither-engine';
+import { DitherAlgorithm, DitherSettings, ColorMode, PaletteSize } from './dither-engine';
 import { ShapeType } from './shape-renderer';
 import { SHAPES, ShapeSource } from './shape-canvas';
 import { parseOBJ } from './obj-parser';
@@ -340,6 +340,31 @@ export function ControlPanel({
         <div>
           <SectionHeader title="Colors" />
           <div className="space-y-2.5">
+
+            {/* Palette size selector — hidden for thermal */}
+            {ditherSettings.colorMode !== 'thermal' && (
+              <div>
+                <span className="text-[#3a3a3a] text-[8px] uppercase tracking-[0.15em] block mb-1.5">
+                  Palette
+                </span>
+                <div className="flex gap-1">
+                  {([2, 3, 4] as PaletteSize[]).map((size) => (
+                    <button
+                      key={size}
+                      onClick={() => onDitherChange({ paletteSize: size })}
+                      className={`flex-1 py-[6px] text-[9px] uppercase tracking-[0.1em] rounded transition-all text-center ${
+                        ditherSettings.paletteSize === size
+                          ? 'bg-[#161616] text-[#aaa] border border-[#303030]'
+                          : 'bg-[#090909] text-[#3a3a3a] border border-[#121212] hover:border-[#222] hover:text-[#555]'
+                      }`}
+                    >
+                      {size === 2 ? '2 Col' : size === 3 ? '3 Col' : '4 Col'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
             <div className="flex items-center gap-3">
               <span className="text-[#3a3a3a] text-[8px] uppercase tracking-[0.15em] w-8">FG</span>
               <div className="flex items-center gap-2 flex-1">
@@ -352,6 +377,39 @@ export function ControlPanel({
                 <span className="text-[#444] text-[9px] tracking-wider">{ditherSettings.fgColor}</span>
               </div>
             </div>
+
+            {/* Mid color 1 — shown for 3 and 4 color palettes */}
+            {ditherSettings.paletteSize >= 3 && ditherSettings.colorMode !== 'thermal' && (
+              <div className="flex items-center gap-3">
+                <span className="text-[#3a3a3a] text-[8px] uppercase tracking-[0.15em] w-8">MID</span>
+                <div className="flex items-center gap-2 flex-1">
+                  <input
+                    type="color"
+                    value={ditherSettings.midColor}
+                    onChange={(e) => onDitherChange({ midColor: e.target.value })}
+                    className="w-7 h-7 bg-transparent border border-[#1a1a1a] rounded cursor-pointer hover:border-[#2a2a2a] transition-colors"
+                  />
+                  <span className="text-[#444] text-[9px] tracking-wider">{ditherSettings.midColor}</span>
+                </div>
+              </div>
+            )}
+
+            {/* Mid color 2 — shown for 4 color palette only */}
+            {ditherSettings.paletteSize >= 4 && ditherSettings.colorMode !== 'thermal' && (
+              <div className="flex items-center gap-3">
+                <span className="text-[#3a3a3a] text-[8px] uppercase tracking-[0.15em] w-8">MD2</span>
+                <div className="flex items-center gap-2 flex-1">
+                  <input
+                    type="color"
+                    value={ditherSettings.mid2Color}
+                    onChange={(e) => onDitherChange({ mid2Color: e.target.value })}
+                    className="w-7 h-7 bg-transparent border border-[#1a1a1a] rounded cursor-pointer hover:border-[#2a2a2a] transition-colors"
+                  />
+                  <span className="text-[#444] text-[9px] tracking-wider">{ditherSettings.mid2Color}</span>
+                </div>
+              </div>
+            )}
+
             <div className="flex items-center gap-3">
               <span className="text-[#3a3a3a] text-[8px] uppercase tracking-[0.15em] w-8">BG</span>
               <div className="flex items-center gap-2 flex-1">
