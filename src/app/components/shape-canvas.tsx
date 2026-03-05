@@ -1,5 +1,5 @@
 import React, { useRef, useEffect, useCallback } from 'react';
-import { ShapeType, renderShape, RotMatrix, identityMatrix, multiplyMatrix, axisAngleMatrix } from './shape-renderer';
+import { ShapeType, renderShape, RotMatrix, multiplyMatrix, axisAngleMatrix } from './shape-renderer';
 import { DitherSettings, applyDithering } from './dither-engine';
 import { ParsedModel, renderOBJToCanvas, renderSVGToCanvas } from './obj-parser';
 import { ExportButton } from './export-button';
@@ -50,20 +50,28 @@ export function ShapeCanvas({
 
   // Trackball rotation matrix (accumulated)
   const rotMatrixRef = useRef<RotMatrix>(
-    // Start with a slight tilt so the shape looks interesting
     multiplyMatrix(
       axisAngleMatrix(1, 0, 0, 0.3),
       axisAngleMatrix(0, 1, 0, 0.4)
     )
   );
 
-  // ─── Mouse drag rotation (trackball) ───
+  // Elapsed time for orbiting lights (always ticking)
+  const elapsedTimeRef = useRef(0);
+
+  // ─── Mouse drag rotation (trackball) with momentum ───
   const draggingRef = useRef(false);
   const lastMouseRef = useRef({ x: 0, y: 0 });
+  // Momentum: velocity of rotation (axis + angular speed)
+  const velocityRef = useRef({ axX: 0, axY: 0, angle: 0 });
+  const lastDragDeltaRef = useRef({ dx: 0, dy: 0, time: 0 });
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     draggingRef.current = true;
     lastMouseRef.current = { x: e.clientX, y: e.clientY };
+    // Kill momentum on grab
+    velocityRef.current = { axX: 0, axY: 0, angle: 0 };
+    lastDragDeltaRef.current = { dx: 0, dy: 0, time: performance.now() };
   }, []);
 
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
@@ -74,27 +82,51 @@ export function ShapeCanvas({
 
     if (dx === 0 && dy === 0) return;
 
-    // Trackball: rotate around the screen-space axis perpendicular to drag
     const sensitivity = 0.006;
     const angle = Math.sqrt(dx * dx + dy * dy) * sensitivity;
-
-    // The rotation axis is perpendicular to the drag direction in screen space
-    // Screen X drag → rotate around Y axis, Screen Y drag → rotate around X axis
     const axLen = Math.sqrt(dx * dx + dy * dy) || 1;
-    const axX = -dy / axLen; // perpendicular to drag
+    const axX = -dy / axLen;
     const axY = dx / axLen;
-    const axZ = 0;
 
-    const increment = axisAngleMatrix(axX, axY, axZ, angle);
+    const increment = axisAngleMatrix(axX, axY, 0, angle);
     rotMatrixRef.current = multiplyMatrix(increment, rotMatrixRef.current);
     needsRenderRef.current = true;
+
+    // Track last delta for momentum
+    lastDragDeltaRef.current = { dx, dy, time: performance.now() };
   }, []);
 
   const handleMouseUp = useCallback(() => {
+    if (draggingRef.current) {
+      // Calculate momentum from last drag delta
+      const { dx, dy, time } = lastDragDeltaRef.current;
+      const elapsed = performance.now() - time;
+      // Only apply momentum if the last move was recent (< 50ms ago)
+      if (elapsed < 50 && (Math.abs(dx) > 1 || Math.abs(dy) > 1)) {
+        const axLen = Math.sqrt(dx * dx + dy * dy) || 1;
+        velocityRef.current = {
+          axX: -dy / axLen,
+          axY: dx / axLen,
+          angle: Math.sqrt(dx * dx + dy * dy) * 0.004,
+        };
+      }
+    }
     draggingRef.current = false;
   }, []);
 
   const handleMouseLeave = useCallback(() => {
+    if (draggingRef.current) {
+      const { dx, dy, time } = lastDragDeltaRef.current;
+      const elapsed = performance.now() - time;
+      if (elapsed < 50 && (Math.abs(dx) > 1 || Math.abs(dy) > 1)) {
+        const axLen = Math.sqrt(dx * dx + dy * dy) || 1;
+        velocityRef.current = {
+          axX: -dy / axLen,
+          axY: dx / axLen,
+          angle: Math.sqrt(dx * dx + dy * dy) * 0.004,
+        };
+      }
+    }
     draggingRef.current = false;
   }, []);
 
@@ -103,6 +135,8 @@ export function ShapeCanvas({
     if (e.touches.length === 1) {
       draggingRef.current = true;
       lastMouseRef.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+      velocityRef.current = { axX: 0, axY: 0, angle: 0 };
+      lastDragDeltaRef.current = { dx: 0, dy: 0, time: performance.now() };
     }
   }, []);
 
@@ -124,13 +158,26 @@ export function ShapeCanvas({
     const increment = axisAngleMatrix(axX, axY, 0, angle);
     rotMatrixRef.current = multiplyMatrix(increment, rotMatrixRef.current);
     needsRenderRef.current = true;
+    lastDragDeltaRef.current = { dx, dy, time: performance.now() };
   }, []);
 
   const handleTouchEnd = useCallback(() => {
+    if (draggingRef.current) {
+      const { dx, dy, time } = lastDragDeltaRef.current;
+      const elapsed = performance.now() - time;
+      if (elapsed < 50 && (Math.abs(dx) > 1 || Math.abs(dy) > 1)) {
+        const axLen = Math.sqrt(dx * dx + dy * dy) || 1;
+        velocityRef.current = {
+          axX: -dy / axLen,
+          axY: dx / axLen,
+          angle: Math.sqrt(dx * dx + dy * dy) * 0.004,
+        };
+      }
+    }
     draggingRef.current = false;
   }, []);
 
-  // Pre-render SVG when source or scale changes
+  // Pre-render SVG
   useEffect(() => {
     if (shapeSource.type === 'svg') {
       svgImageDataRef.current = null;
@@ -154,6 +201,7 @@ export function ShapeCanvas({
     needsRenderRef.current = true;
   }, [shapeSource, ditherSettings, extrudeScale, autoRotate, rotationSpeed, zoom]);
 
+  // Main animation loop
   useEffect(() => {
     const canvas = canvasRef.current;
     const container = containerRef.current;
@@ -170,27 +218,36 @@ export function ShapeCanvas({
       const dt = lastTime ? (timestamp - lastTime) / 1000 : 0.016;
       lastTime = timestamp;
 
-      // Auto-rotate: spin around Y axis
+      // Always tick elapsed time for orbiting lights
+      elapsedTimeRef.current += dt;
+
+      // Auto-rotate
       if (autoRotate && !draggingRef.current) {
         const speed = rotationSpeed / 50;
         const autoRot = axisAngleMatrix(0, 1, 0, dt * speed * 0.8);
         rotMatrixRef.current = multiplyMatrix(autoRot, rotMatrixRef.current);
-        needsRenderRef.current = true;
       }
 
-      if (!needsRenderRef.current && !autoRotate) {
-        animRef.current = requestAnimationFrame(render);
-        return;
+      // Apply momentum (smooth deceleration)
+      const vel = velocityRef.current;
+      if (vel.angle > 0.0001) {
+        const momentumRot = axisAngleMatrix(vel.axX, vel.axY, 0, vel.angle);
+        rotMatrixRef.current = multiplyMatrix(momentumRot, rotMatrixRef.current);
+        // Dampen — smooth exponential decay
+        vel.angle *= Math.pow(0.04, dt); // decays to near-zero over ~1s
+        needsRenderRef.current = true;
+      } else {
+        vel.angle = 0;
       }
-      needsRenderRef.current = false;
+
+      // Orbiting lights always cause re-render
+      needsRenderRef.current = true;
 
       const cw = container.clientWidth;
       const ch = container.clientHeight;
       canvas.width = cw;
       canvas.height = ch;
 
-      // Render at reduced resolution for performance, then scale up
-      // Higher values = finer detail but slower
       const rScale = 0.45;
       const rw = Math.max(1, Math.floor(cw * rScale));
       const rh = Math.max(1, Math.floor(ch * rScale));
@@ -202,9 +259,8 @@ export function ShapeCanvas({
       let shapeImg: ImageData;
 
       if (shapeSource.type === 'primitive') {
-        shapeImg = renderShape(ctx, shapeSource.shape, rw, rh, rotMatrixRef.current, camDist);
+        shapeImg = renderShape(ctx, shapeSource.shape, rw, rh, rotMatrixRef.current, camDist, elapsedTimeRef.current);
       } else if (shapeSource.type === 'obj') {
-        // OBJ still uses euler angle approximation from matrix
         const rotY = Math.atan2(rotMatrixRef.current[2], rotMatrixRef.current[0]);
         shapeImg = renderOBJToCanvas(ctx, shapeSource.model, rw, rh, rotY, extrudeScale);
       } else if (shapeSource.type === 'svg' && svgImageDataRef.current) {
@@ -243,7 +299,7 @@ export function ShapeCanvas({
         if (expCtx) expCtx.putImageData(finalImg, 0, 0);
       }
 
-      // Draw to display canvas (scale up with nearest-neighbor for crisp pixels)
+      // Draw to display canvas
       const offscreen = document.createElement('canvas');
       offscreen.width = finalImg.width;
       offscreen.height = finalImg.height;
