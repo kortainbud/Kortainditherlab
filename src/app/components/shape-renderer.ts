@@ -1,281 +1,331 @@
-// Lightweight 3D shape rendering using projected polygon meshes + Canvas 2D
+// Per-pixel raytraced shape rendering with metallic/specular lighting
+// Uses analytic intersections + SDF raymarching for smooth shading
 
 export type ShapeType = 'sphere' | 'torus' | 'cube' | 'cylinder' | 'octahedron' | 'pyramid' | 'diamond' | 'cone';
 
-interface Vec3 { x: number; y: number; z: number }
-interface Mesh { verts: Vec3[]; faces: number[][] }
+// ─── Rotation matrix (trackball-style, accumulated) ───
 
-// ─── Mesh generators ───
+export type RotMatrix = [number, number, number, number, number, number, number, number, number];
 
-function makeSphere(seg = 16): Mesh {
-  const verts: Vec3[] = [];
-  const faces: number[][] = [];
-  for (let lat = 0; lat <= seg; lat++) {
-    const theta = (lat / seg) * Math.PI;
-    const st = Math.sin(theta), ct = Math.cos(theta);
-    for (let lon = 0; lon <= seg; lon++) {
-      const phi = (lon / seg) * Math.PI * 2;
-      verts.push({ x: st * Math.cos(phi), y: ct, z: st * Math.sin(phi) });
-    }
-  }
-  const w = seg + 1;
-  for (let lat = 0; lat < seg; lat++) {
-    for (let lon = 0; lon < seg; lon++) {
-      const a = lat * w + lon, b = a + 1, c = a + w, d = c + 1;
-      faces.push([a, c, d, b]);
-    }
-  }
-  return { verts, faces };
+export function identityMatrix(): RotMatrix {
+  return [1, 0, 0, 0, 1, 0, 0, 0, 1];
 }
 
-function makeTorus(R = 0.7, r = 0.28, segR = 20, segr = 10): Mesh {
-  const verts: Vec3[] = [];
-  const faces: number[][] = [];
-  for (let i = 0; i <= segR; i++) {
-    const phi = (i / segR) * Math.PI * 2;
-    const cp = Math.cos(phi), sp = Math.sin(phi);
-    for (let j = 0; j <= segr; j++) {
-      const theta = (j / segr) * Math.PI * 2;
-      const ct = Math.cos(theta), st = Math.sin(theta);
-      verts.push({
-        x: (R + r * ct) * cp,
-        y: r * st,
-        z: (R + r * ct) * sp,
-      });
-    }
-  }
-  const w = segr + 1;
-  for (let i = 0; i < segR; i++) {
-    for (let j = 0; j < segr; j++) {
-      const a = i * w + j, b = a + 1, c = a + w, d = c + 1;
-      faces.push([a, c, d, b]);
-    }
-  }
-  return { verts, faces };
+export function multiplyMatrix(a: RotMatrix, b: RotMatrix): RotMatrix {
+  return [
+    a[0]*b[0]+a[1]*b[3]+a[2]*b[6], a[0]*b[1]+a[1]*b[4]+a[2]*b[7], a[0]*b[2]+a[1]*b[5]+a[2]*b[8],
+    a[3]*b[0]+a[4]*b[3]+a[5]*b[6], a[3]*b[1]+a[4]*b[4]+a[5]*b[7], a[3]*b[2]+a[4]*b[5]+a[5]*b[8],
+    a[6]*b[0]+a[7]*b[3]+a[8]*b[6], a[6]*b[1]+a[7]*b[4]+a[8]*b[7], a[6]*b[2]+a[7]*b[5]+a[8]*b[8],
+  ];
 }
 
-function makeCube(): Mesh {
-  const s = 0.8;
-  const verts: Vec3[] = [
-    { x: -s, y: -s, z: -s }, { x: s, y: -s, z: -s },
-    { x: s, y: s, z: -s },  { x: -s, y: s, z: -s },
-    { x: -s, y: -s, z: s },  { x: s, y: -s, z: s },
-    { x: s, y: s, z: s },   { x: -s, y: s, z: s },
+/** Build a rotation matrix from an axis (must be unit) and angle in radians */
+export function axisAngleMatrix(ax: number, ay: number, az: number, angle: number): RotMatrix {
+  const c = Math.cos(angle), s = Math.sin(angle), t = 1 - c;
+  return [
+    t*ax*ax + c,    t*ax*ay - s*az, t*ax*az + s*ay,
+    t*ax*ay + s*az, t*ay*ay + c,    t*ay*az - s*ax,
+    t*ax*az - s*ay, t*ay*az + s*ax, t*az*az + c,
   ];
-  const faces = [
-    [0, 1, 2, 3], [5, 4, 7, 6], [1, 5, 6, 2],
-    [4, 0, 3, 7], [3, 2, 6, 7], [4, 5, 1, 0],
-  ];
-  return { verts, faces };
 }
 
-function makeCylinder(seg = 20): Mesh {
-  const verts: Vec3[] = [];
-  const faces: number[][] = [];
-  const r = 0.6, h = 0.8;
-  // Top and bottom rings
-  for (let i = 0; i <= seg; i++) {
-    const a = (i / seg) * Math.PI * 2;
-    verts.push({ x: r * Math.cos(a), y: h, z: r * Math.sin(a) });
+function applyMatrix(m: RotMatrix, x: number, y: number, z: number): [number, number, number] {
+  return [
+    m[0]*x + m[1]*y + m[2]*z,
+    m[3]*x + m[4]*y + m[5]*z,
+    m[6]*x + m[7]*y + m[8]*z,
+  ];
+}
+
+// ─── Vector helpers ───
+
+function dot3(ax: number, ay: number, az: number, bx: number, by: number, bz: number): number {
+  return ax*bx + ay*by + az*bz;
+}
+function len3(x: number, y: number, z: number): number {
+  return Math.sqrt(x*x + y*y + z*z);
+}
+function normalize3(x: number, y: number, z: number): [number, number, number] {
+  const l = len3(x, y, z) || 1;
+  return [x/l, y/l, z/l];
+}
+function reflect3(ix: number, iy: number, iz: number, nx: number, ny: number, nz: number): [number, number, number] {
+  const d = 2 * dot3(ix, iy, iz, nx, ny, nz);
+  return [ix - d*nx, iy - d*ny, iz - d*nz];
+}
+
+// ─── SDF functions (for raymarching shapes) ───
+
+function sdfSphere(px: number, py: number, pz: number): number {
+  return len3(px, py, pz) - 1.0;
+}
+
+function sdfTorus(px: number, py: number, pz: number, R: number, r: number): number {
+  const qx = Math.sqrt(px*px + pz*pz) - R;
+  return Math.sqrt(qx*qx + py*py) - r;
+}
+
+function sdfBox(px: number, py: number, pz: number, sx: number, sy: number, sz: number): number {
+  const dx = Math.abs(px) - sx;
+  const dy = Math.abs(py) - sy;
+  const dz = Math.abs(pz) - sz;
+  const outside = len3(Math.max(dx, 0), Math.max(dy, 0), Math.max(dz, 0));
+  const inside = Math.min(Math.max(dx, dy, dz), 0);
+  return outside + inside;
+}
+
+function sdfCylinder(px: number, py: number, pz: number, r: number, h: number): number {
+  const d = Math.sqrt(px*px + pz*pz) - r;
+  const dy = Math.abs(py) - h;
+  const outside = len3(Math.max(d, 0), Math.max(dy, 0), 0);
+  const inside = Math.min(Math.max(d, dy), 0);
+  return outside + inside;
+}
+
+function sdfOctahedron(px: number, py: number, pz: number, s: number): number {
+  const ax = Math.abs(px), ay = Math.abs(py), az = Math.abs(pz);
+  const m = ax + ay + az - s;
+  let qx: number, qy: number, qz: number;
+  if (3.0 * ax < m) { qx = ax; qy = ay; qz = az; }
+  else if (3.0 * ay < m) { qx = ay; qy = az; qz = ax; }
+  else if (3.0 * az < m) { qx = az; qy = ax; qz = ay; }
+  else return m * 0.57735027;
+  const k = Math.min(Math.max(0.5 * (qz - qy + s), 0.0), s);
+  return Math.sqrt((qx) * (qx) + (qy - s + k) * (qy - s + k) + (qz - k) * (qz - k));
+}
+
+function sdfCone(px: number, py: number, pz: number, r: number, h: number): number {
+  // Cone with tip at top, base at bottom
+  const py2 = py - h * 0.3; // shift
+  const q = Math.sqrt(px*px + pz*pz);
+  const tip = h * 0.7;
+  const base = -h * 0.3;
+  const totalH = tip - base;
+  const t = (tip - py2) / totalH;
+  const coneR = r * Math.max(t, 0);
+  const dRadial = q - coneR;
+  if (py2 > tip) {
+    return len3(q, py2 - tip, 0);
   }
-  for (let i = 0; i <= seg; i++) {
-    const a = (i / seg) * Math.PI * 2;
-    verts.push({ x: r * Math.cos(a), y: -h, z: r * Math.sin(a) });
+  if (py2 < base) {
+    return Math.max(q - r, base - py2);
   }
-  const w = seg + 1;
-  for (let i = 0; i < seg; i++) {
-    faces.push([i, i + 1, i + 1 + w, i + w]);
-  }
-  // Top cap
-  const topCenter = verts.length;
-  verts.push({ x: 0, y: h, z: 0 });
-  for (let i = 0; i < seg; i++) faces.push([topCenter, i, i + 1]);
-  // Bottom cap
-  const botCenter = verts.length;
-  verts.push({ x: 0, y: -h, z: 0 });
-  for (let i = 0; i < seg; i++) faces.push([botCenter, i + 1 + w, i + w]);
-  return { verts, faces };
+  const slope = Math.sqrt(r*r + totalH*totalH);
+  return dRadial * totalH / slope;
 }
 
-function makeOctahedron(): Mesh {
-  const s = 1.0;
-  const verts: Vec3[] = [
-    { x: 0, y: s, z: 0 }, { x: 0, y: -s, z: 0 },
-    { x: s, y: 0, z: 0 }, { x: -s, y: 0, z: 0 },
-    { x: 0, y: 0, z: s }, { x: 0, y: 0, z: -s },
-  ];
-  const faces = [
-    [0, 4, 2], [0, 2, 5], [0, 5, 3], [0, 3, 4],
-    [1, 2, 4], [1, 5, 2], [1, 3, 5], [1, 4, 3],
-  ];
-  return { verts, faces };
+function sdfPyramid(px: number, py: number, pz: number, h: number): number {
+  const m2 = h * h + 0.25;
+  const ax = Math.abs(px), az = Math.abs(pz);
+  // Symmetry: fold into one quadrant
+  const bx = az > ax ? az : ax;
+  const bz = az > ax ? ax : az;
+  
+  const shifted = py + 0.3;
+  const s = Math.max(-shifted, 0.0);
+  const d = Math.max(bx - 0.85, 0.0);
+  if (shifted < -0.3) return Math.sqrt(s * s + d * d);
+  
+  // Compute distance to sloped face
+  const wx = bx - 0.85 * Math.max(1.0 - shifted / h, 0.0);
+  const wy = shifted - h;
+  
+  if (wx > 0 && wy > 0) return Math.sqrt(wx * wx + wy * wy);
+  if (wy > 0) return wy;
+  
+  // Approximate inside distance
+  const slopeLen = Math.sqrt(h * h + 0.85 * 0.85);
+  const dist = (wx * h + wy * 0.85) / slopeLen;
+  return Math.max(dist, -shifted - 0.3);
 }
 
-function makePyramid(): Mesh {
-  const s = 0.85, h = 1.1;
-  const verts: Vec3[] = [
-    { x: 0, y: h, z: 0 },
-    { x: -s, y: -0.5, z: -s }, { x: s, y: -0.5, z: -s },
-    { x: s, y: -0.5, z: s },  { x: -s, y: -0.5, z: s },
-  ];
-  const faces = [
-    [0, 1, 2], [0, 2, 3], [0, 3, 4], [0, 4, 1],
-    [1, 4, 3, 2],
-  ];
-  return { verts, faces };
-}
-
-function makeDiamond(): Mesh {
+function sdfDiamond(px: number, py: number, pz: number): number {
+  // Elongated octahedron (bipyramid)
+  const ax = Math.abs(px), ay = Math.abs(py), az = Math.abs(pz);
   const s = 0.75, h = 1.15;
-  const verts: Vec3[] = [
-    { x: 0, y: h, z: 0 }, { x: 0, y: -h, z: 0 },
-    { x: s, y: 0, z: 0 }, { x: 0, y: 0, z: s },
-    { x: -s, y: 0, z: 0 }, { x: 0, y: 0, z: -s },
-  ];
-  const faces = [
-    [0, 2, 3], [0, 3, 4], [0, 4, 5], [0, 5, 2],
-    [1, 3, 2], [1, 4, 3], [1, 5, 4], [1, 2, 5],
-  ];
-  return { verts, faces };
+  // Scale to unit octahedron space
+  const m = ax / s + ay / h + az / s - 1.0;
+  // Approximate signed distance
+  return m * Math.min(s, h) * 0.57735;
 }
 
-function makeCone(seg = 20): Mesh {
-  const verts: Vec3[] = [];
-  const faces: number[][] = [];
-  const r = 0.7, h = 1.1;
-  // Apex
-  verts.push({ x: 0, y: h, z: 0 });
-  // Base ring
-  for (let i = 0; i <= seg; i++) {
-    const a = (i / seg) * Math.PI * 2;
-    verts.push({ x: r * Math.cos(a), y: -0.4, z: r * Math.sin(a) });
-  }
-  for (let i = 0; i < seg; i++) {
-    faces.push([0, i + 1, i + 2]);
-  }
-  // Base cap
-  const center = verts.length;
-  verts.push({ x: 0, y: -0.4, z: 0 });
-  for (let i = 0; i < seg; i++) {
-    faces.push([center, i + 2, i + 1]);
-  }
-  return { verts, faces };
-}
+// ─── Get SDF for a shape ───
 
-function getMesh(shape: ShapeType): Mesh {
+type SDFFn = (px: number, py: number, pz: number) => number;
+
+function getShapeSDF(shape: ShapeType): SDFFn {
   switch (shape) {
-    case 'sphere': return makeSphere(14);
-    case 'torus': return makeTorus();
-    case 'cube': return makeCube();
-    case 'cylinder': return makeCylinder(18);
-    case 'octahedron': return makeOctahedron();
-    case 'pyramid': return makePyramid();
-    case 'diamond': return makeDiamond();
-    case 'cone': return makeCone(18);
+    case 'sphere': return sdfSphere;
+    case 'torus': return (px, py, pz) => sdfTorus(px, py, pz, 0.7, 0.3);
+    case 'cube': return (px, py, pz) => sdfBox(px, py, pz, 0.75, 0.75, 0.75);
+    case 'cylinder': return (px, py, pz) => sdfCylinder(px, py, pz, 0.6, 0.85);
+    case 'octahedron': return (px, py, pz) => sdfOctahedron(px, py, pz, 1.0);
+    case 'pyramid': return (px, py, pz) => sdfPyramid(px, py, pz, 1.1);
+    case 'diamond': return sdfDiamond;
+    case 'cone': return (px, py, pz) => sdfCone(px, py, pz, 0.7, 1.0);
   }
 }
 
-// ─── Transform + Render ───
+// ─── Per-pixel raymarched rendering ───
 
-function rotateY(v: Vec3, a: number): Vec3 {
-  const c = Math.cos(a), s = Math.sin(a);
-  return { x: v.x * c + v.z * s, y: v.y, z: -v.x * s + v.z * c };
-}
-function rotateX(v: Vec3, a: number): Vec3 {
-  const c = Math.cos(a), s = Math.sin(a);
-  return { x: v.x, y: v.y * c - v.z * s, z: v.y * s + v.z * c };
+function calcNormal(sdf: SDFFn, px: number, py: number, pz: number): [number, number, number] {
+  const e = 0.001;
+  const nx = sdf(px+e, py, pz) - sdf(px-e, py, pz);
+  const ny = sdf(px, py+e, pz) - sdf(px, py-e, pz);
+  const nz = sdf(px, py, pz+e) - sdf(px, py, pz-e);
+  return normalize3(nx, ny, nz);
 }
 
-function cross(a: Vec3, b: Vec3): Vec3 {
-  return { x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x };
-}
-function sub(a: Vec3, b: Vec3): Vec3 {
-  return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
-}
-function dot(a: Vec3, b: Vec3): number {
-  return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-function len(v: Vec3): number {
-  return Math.sqrt(dot(v, v));
-}
-function norm(v: Vec3): Vec3 {
-  const l = len(v) || 1;
-  return { x: v.x / l, y: v.y / l, z: v.z / l };
+// Fake environment map for metallic reflections
+function envMap(rx: number, ry: number, rz: number): [number, number, number] {
+  // Gradient based on reflection direction — simulates a studio HDRI
+  const t = ry * 0.5 + 0.5; // 0 (down) to 1 (up)
+  
+  // Bright rim at top
+  const topLight = Math.pow(Math.max(ry, 0), 2.0) * 0.6;
+  
+  // Side light panels
+  const sideLight = Math.pow(Math.max(Math.abs(rx) - 0.3, 0), 1.5) * 0.3;
+  
+  // Warm fill from below
+  const fillLight = Math.pow(Math.max(-ry - 0.2, 0), 2.0) * 0.15;
+  
+  // Base gradient
+  const base = t * 0.15 + 0.02;
+  
+  const intensity = base + topLight + sideLight + fillLight;
+  
+  // Slight warm tint
+  return [
+    Math.min(intensity * 1.02, 1.0),
+    Math.min(intensity * 1.0, 1.0),
+    Math.min(intensity * 0.96, 1.0),
+  ];
 }
 
 export function renderShape(
-  ctx: CanvasRenderingContext2D,
+  _ctx: CanvasRenderingContext2D,
   shape: ShapeType,
   width: number,
   height: number,
-  rotY: number,
-  rotX: number,
+  rotMatrix: RotMatrix,
+  camDist: number = 3.5,
 ): ImageData {
-  const mesh = getMesh(shape);
+  const sdf = getShapeSDF(shape);
   const aspect = width / height;
-  const camDist = 3.5;
-  const lightDir = norm({ x: 0.5, y: 0.8, z: -0.6 });
+  const fov = 1.8; // field of view factor
+  
+  // Lighting
+  const [lx, ly, lz] = normalize3(0.6, 0.9, -0.5);
+  // Secondary fill light
+  const [l2x, l2y, l2z] = normalize3(-0.4, -0.2, -0.8);
 
-  // Transform verts
-  const transformed = mesh.verts.map((v) => {
-    let tv = rotateY(v, rotY);
-    tv = rotateX(tv, rotX);
-    return tv;
-  });
+  const pixels = new Uint8ClampedArray(width * height * 4);
 
-  // Project to screen
-  const projected = transformed.map((v) => {
-    const d = camDist - v.z;
-    return {
-      sx: (v.x / (d * aspect)) * 0.5 + 0.5,
-      sy: (-v.y / d) * 0.5 + 0.5,
-      z: v.z,
-    };
-  });
-
-  // Create offscreen canvas for polygon rendering
-  const offCanvas = document.createElement('canvas');
-  offCanvas.width = width;
-  offCanvas.height = height;
-  const offCtx = offCanvas.getContext('2d')!;
-  offCtx.fillStyle = '#000';
-  offCtx.fillRect(0, 0, width, height);
-
-  // Sort faces back-to-front
-  const facesWithDepth = mesh.faces.map((face, i) => {
-    let avgZ = 0;
-    for (const vi of face) avgZ += transformed[vi].z;
-    avgZ /= face.length;
-    return { face, z: avgZ };
-  });
-  facesWithDepth.sort((a, b) => a.z - b.z);
-
-  for (const { face } of facesWithDepth) {
-    if (face.length < 3) continue;
-
-    const v0 = transformed[face[0]];
-    const v1 = transformed[face[1]];
-    const v2 = transformed[face[2]];
-    const n = norm(cross(sub(v1, v0), sub(v2, v0)));
-
-    // Backface culling
-    if (n.z > 0) continue;
-
-    const diffuse = Math.max(0, dot(n, lightDir));
-    const brightness = Math.min(255, Math.round((diffuse * 0.78 + 0.12) * 255));
-    const hex = brightness.toString(16).padStart(2, '0');
-
-    offCtx.beginPath();
-    const p0 = projected[face[0]];
-    offCtx.moveTo(p0.sx * width, p0.sy * height);
-    for (let i = 1; i < face.length; i++) {
-      const p = projected[face[i]];
-      offCtx.lineTo(p.sx * width, p.sy * height);
+  for (let py = 0; py < height; py++) {
+    for (let px = 0; px < width; px++) {
+      const u = (px / width - 0.5) * fov * aspect;
+      const v = -(py / height - 0.5) * fov;
+      
+      // Ray from camera
+      const [rdx, rdy, rdz] = normalize3(u, v, -1);
+      let rox = 0, roy = 0, roz = camDist;
+      
+      // Raymarch
+      let t = 0;
+      let hit = false;
+      const maxDist = 20;
+      const maxSteps = 80;
+      
+      for (let i = 0; i < maxSteps; i++) {
+        const wx = rox + rdx * t;
+        const wy = roy + rdy * t;
+        const wz = roz + rdz * t;
+        
+        // Transform world pos by inverse rotation (rotate the point into object space)
+        const [ox, oy, oz] = applyMatrix(rotMatrix, wx, wy, wz);
+        
+        const d = sdf(ox, oy, oz);
+        if (d < 0.001) {
+          hit = true;
+          break;
+        }
+        t += d;
+        if (t > maxDist) break;
+      }
+      
+      const idx = (py * width + px) * 4;
+      
+      if (hit) {
+        const hx = rox + rdx * t;
+        const hy = roy + rdy * t;
+        const hz = roz + rdz * t;
+        
+        // Get normal in object space, then rotate to world space
+        const [ohx, ohy, ohz] = applyMatrix(rotMatrix, hx, hy, hz);
+        const [onx, ony, onz] = calcNormal(sdf, ohx, ohy, ohz);
+        
+        // Rotate normal back to world space (transpose of rotation matrix = inverse)
+        const invRot: RotMatrix = [
+          rotMatrix[0], rotMatrix[3], rotMatrix[6],
+          rotMatrix[1], rotMatrix[4], rotMatrix[7],
+          rotMatrix[2], rotMatrix[5], rotMatrix[8],
+        ];
+        const [nx, ny, nz] = applyMatrix(invRot, onx, ony, onz);
+        
+        // View direction (from hit point to camera)
+        const [vx, vy, vz] = normalize3(-rdx, -rdy, -rdz);
+        
+        // ─── Metallic/Chrome lighting ───
+        
+        // Key light diffuse
+        const diff1 = Math.max(0, dot3(nx, ny, nz, lx, ly, lz));
+        
+        // Fill light diffuse (softer)
+        const diff2 = Math.max(0, dot3(nx, ny, nz, l2x, l2y, l2z)) * 0.25;
+        
+        // Hemisphere ambient
+        const ambient = 0.04 + ny * 0.03;
+        
+        // Blinn-Phong specular (key light)
+        const [h1x, h1y, h1z] = normalize3(lx + vx, ly + vy, lz + vz);
+        const spec1 = Math.pow(Math.max(0, dot3(nx, ny, nz, h1x, h1y, h1z)), 64) * 1.2;
+        
+        // Specular (fill light)
+        const [h2x, h2y, h2z] = normalize3(l2x + vx, l2y + vy, l2z + vz);
+        const spec2 = Math.pow(Math.max(0, dot3(nx, ny, nz, h2x, h2y, h2z)), 32) * 0.3;
+        
+        // Fresnel (more reflection at grazing angles)
+        const NdotV = Math.max(0, dot3(nx, ny, nz, vx, vy, vz));
+        const fresnel = 0.04 + 0.96 * Math.pow(1 - NdotV, 5);
+        
+        // Environment reflection
+        const [rx, ry, rz] = reflect3(-vx, -vy, -vz, nx, ny, nz);
+        const [envR, envG, envB] = envMap(rx, ry, rz);
+        
+        // Combine: mix between diffuse and specular/reflection based on metallic fresnel
+        const metallic = 0.65; // how metallic the material is
+        
+        const diffuse = diff1 * 0.6 + diff2 + ambient;
+        const specular = spec1 + spec2;
+        
+        const r = ((1 - metallic) * diffuse + metallic * envR * fresnel + specular) * 255;
+        const g = ((1 - metallic) * diffuse + metallic * envG * fresnel + specular) * 255;
+        const b = ((1 - metallic) * diffuse + metallic * envB * fresnel + specular) * 255;
+        
+        pixels[idx]     = Math.min(255, Math.max(0, r));
+        pixels[idx + 1] = Math.min(255, Math.max(0, g));
+        pixels[idx + 2] = Math.min(255, Math.max(0, b));
+        pixels[idx + 3] = 255;
+      } else {
+        // Background: black
+        pixels[idx] = 0;
+        pixels[idx + 1] = 0;
+        pixels[idx + 2] = 0;
+        pixels[idx + 3] = 255;
+      }
     }
-    offCtx.closePath();
-    offCtx.fillStyle = `#${hex}${hex}${hex}`;
-    offCtx.fill();
   }
 
-  return offCtx.getImageData(0, 0, width, height);
+  return new ImageData(pixels, width, height);
 }

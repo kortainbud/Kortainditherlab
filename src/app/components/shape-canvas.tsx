@@ -1,5 +1,5 @@
 import React, { useRef, useEffect, useCallback } from 'react';
-import { ShapeType, renderShape } from './shape-renderer';
+import { ShapeType, renderShape, RotMatrix, identityMatrix, multiplyMatrix, axisAngleMatrix } from './shape-renderer';
 import { DitherSettings, applyDithering } from './dither-engine';
 import { ParsedModel, renderOBJToCanvas, renderSVGToCanvas } from './obj-parser';
 import { ExportButton } from './export-button';
@@ -30,6 +30,7 @@ interface ShapeCanvasProps {
   extrudeScale: number;
   autoRotate: boolean;
   rotationSpeed: number;
+  zoom: number;
 }
 
 export function ShapeCanvas({
@@ -40,11 +41,94 @@ export function ShapeCanvas({
   extrudeScale,
   autoRotate,
   rotationSpeed,
+  zoom,
 }: ShapeCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const animRef = useRef<number>(0);
-  const angleRef = useRef({ y: 0.4, x: 0.3 });
   const svgImageDataRef = useRef<ImageData | null>(null);
+  const needsRenderRef = useRef(true);
+
+  // Trackball rotation matrix (accumulated)
+  const rotMatrixRef = useRef<RotMatrix>(
+    // Start with a slight tilt so the shape looks interesting
+    multiplyMatrix(
+      axisAngleMatrix(1, 0, 0, 0.3),
+      axisAngleMatrix(0, 1, 0, 0.4)
+    )
+  );
+
+  // ─── Mouse drag rotation (trackball) ───
+  const draggingRef = useRef(false);
+  const lastMouseRef = useRef({ x: 0, y: 0 });
+
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    draggingRef.current = true;
+    lastMouseRef.current = { x: e.clientX, y: e.clientY };
+  }, []);
+
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    if (!draggingRef.current) return;
+    const dx = e.clientX - lastMouseRef.current.x;
+    const dy = e.clientY - lastMouseRef.current.y;
+    lastMouseRef.current = { x: e.clientX, y: e.clientY };
+
+    if (dx === 0 && dy === 0) return;
+
+    // Trackball: rotate around the screen-space axis perpendicular to drag
+    const sensitivity = 0.006;
+    const angle = Math.sqrt(dx * dx + dy * dy) * sensitivity;
+
+    // The rotation axis is perpendicular to the drag direction in screen space
+    // Screen X drag → rotate around Y axis, Screen Y drag → rotate around X axis
+    const axLen = Math.sqrt(dx * dx + dy * dy) || 1;
+    const axX = -dy / axLen; // perpendicular to drag
+    const axY = dx / axLen;
+    const axZ = 0;
+
+    const increment = axisAngleMatrix(axX, axY, axZ, angle);
+    rotMatrixRef.current = multiplyMatrix(increment, rotMatrixRef.current);
+    needsRenderRef.current = true;
+  }, []);
+
+  const handleMouseUp = useCallback(() => {
+    draggingRef.current = false;
+  }, []);
+
+  const handleMouseLeave = useCallback(() => {
+    draggingRef.current = false;
+  }, []);
+
+  // Touch support
+  const handleTouchStart = useCallback((e: React.TouchEvent) => {
+    if (e.touches.length === 1) {
+      draggingRef.current = true;
+      lastMouseRef.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    }
+  }, []);
+
+  const handleTouchMove = useCallback((e: React.TouchEvent) => {
+    if (!draggingRef.current || e.touches.length !== 1) return;
+    e.preventDefault();
+    const dx = e.touches[0].clientX - lastMouseRef.current.x;
+    const dy = e.touches[0].clientY - lastMouseRef.current.y;
+    lastMouseRef.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+
+    if (dx === 0 && dy === 0) return;
+
+    const sensitivity = 0.006;
+    const angle = Math.sqrt(dx * dx + dy * dy) * sensitivity;
+    const axLen = Math.sqrt(dx * dx + dy * dy) || 1;
+    const axX = -dy / axLen;
+    const axY = dx / axLen;
+
+    const increment = axisAngleMatrix(axX, axY, 0, angle);
+    rotMatrixRef.current = multiplyMatrix(increment, rotMatrixRef.current);
+    needsRenderRef.current = true;
+  }, []);
+
+  const handleTouchEnd = useCallback(() => {
+    draggingRef.current = false;
+  }, []);
 
   // Pre-render SVG when source or scale changes
   useEffect(() => {
@@ -57,12 +141,18 @@ export function ShapeCanvas({
       renderSVGToCanvas(shapeSource.svgText, Math.floor(cw * 0.6), Math.floor(ch * 0.6), extrudeScale).then(
         (imgData) => {
           svgImageDataRef.current = imgData;
+          needsRenderRef.current = true;
         }
       );
     } else {
       svgImageDataRef.current = null;
     }
   }, [shapeSource, extrudeScale]);
+
+  // Mark render needed when settings change
+  useEffect(() => {
+    needsRenderRef.current = true;
+  }, [shapeSource, ditherSettings, extrudeScale, autoRotate, rotationSpeed, zoom]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -80,31 +170,46 @@ export function ShapeCanvas({
       const dt = lastTime ? (timestamp - lastTime) / 1000 : 0.016;
       lastTime = timestamp;
 
-      if (autoRotate) {
-        const speed = (rotationSpeed / 50); // normalize: 50 = 1x
-        angleRef.current.y += dt * speed * 0.8;
-        angleRef.current.x = Math.sin(angleRef.current.y * 0.3) * 0.35;
+      // Auto-rotate: spin around Y axis
+      if (autoRotate && !draggingRef.current) {
+        const speed = rotationSpeed / 50;
+        const autoRot = axisAngleMatrix(0, 1, 0, dt * speed * 0.8);
+        rotMatrixRef.current = multiplyMatrix(autoRot, rotMatrixRef.current);
+        needsRenderRef.current = true;
       }
+
+      if (!needsRenderRef.current && !autoRotate) {
+        animRef.current = requestAnimationFrame(render);
+        return;
+      }
+      needsRenderRef.current = false;
 
       const cw = container.clientWidth;
       const ch = container.clientHeight;
       canvas.width = cw;
       canvas.height = ch;
 
-      const rScale = 0.5;
-      const rw = Math.floor(cw * rScale);
-      const rh = Math.floor(ch * rScale);
+      // Render at reduced resolution for performance, then scale up
+      // Higher values = finer detail but slower
+      const rScale = 0.45;
+      const rw = Math.max(1, Math.floor(cw * rScale));
+      const rh = Math.max(1, Math.floor(ch * rScale));
+
+      // Map zoom (1-100) to camera distance
+      const zoomFactor = zoom / 50;
+      const camDist = 3.5 / Math.pow(zoomFactor, 0.7);
 
       let shapeImg: ImageData;
 
       if (shapeSource.type === 'primitive') {
-        shapeImg = renderShape(ctx, shapeSource.shape, rw, rh, angleRef.current.y, angleRef.current.x);
+        shapeImg = renderShape(ctx, shapeSource.shape, rw, rh, rotMatrixRef.current, camDist);
       } else if (shapeSource.type === 'obj') {
-        shapeImg = renderOBJToCanvas(ctx, shapeSource.model, rw, rh, angleRef.current.y, extrudeScale);
+        // OBJ still uses euler angle approximation from matrix
+        const rotY = Math.atan2(rotMatrixRef.current[2], rotMatrixRef.current[0]);
+        shapeImg = renderOBJToCanvas(ctx, shapeSource.model, rw, rh, rotY, extrudeScale);
       } else if (shapeSource.type === 'svg' && svgImageDataRef.current) {
         shapeImg = svgImageDataRef.current;
       } else if (shapeSource.type === 'gif') {
-        // Render GIF image frame
         const offCanvas = document.createElement('canvas');
         offCanvas.width = rw;
         offCanvas.height = rh;
@@ -138,7 +243,7 @@ export function ShapeCanvas({
         if (expCtx) expCtx.putImageData(finalImg, 0, 0);
       }
 
-      // Draw to display canvas
+      // Draw to display canvas (scale up with nearest-neighbor for crisp pixels)
       const offscreen = document.createElement('canvas');
       offscreen.width = finalImg.width;
       offscreen.height = finalImg.height;
@@ -151,9 +256,7 @@ export function ShapeCanvas({
         ctx.drawImage(offscreen, 0, 0, finalImg.width, finalImg.height, 0, 0, cw, ch);
       }
 
-      if (autoRotate || shapeSource.type === 'obj') {
-        animRef.current = requestAnimationFrame(render);
-      }
+      animRef.current = requestAnimationFrame(render);
     }
 
     animRef.current = requestAnimationFrame(render);
@@ -162,17 +265,27 @@ export function ShapeCanvas({
       running = false;
       cancelAnimationFrame(animRef.current);
     };
-  }, [shapeSource, ditherSettings, extrudeScale, autoRotate, rotationSpeed]);
+  }, [shapeSource, ditherSettings, extrudeScale, autoRotate, rotationSpeed, zoom]);
 
   return (
     <div
       ref={containerRef}
-      className="flex-1 relative overflow-hidden bg-black"
+      className="flex-1 relative overflow-hidden bg-black select-none"
+      style={{ cursor: draggingRef.current ? 'grabbing' : 'grab' }}
+      onMouseDown={handleMouseDown}
+      onMouseMove={handleMouseMove}
+      onMouseUp={handleMouseUp}
+      onMouseLeave={handleMouseLeave}
+      onTouchStart={handleTouchStart}
+      onTouchMove={handleTouchMove}
+      onTouchEnd={handleTouchEnd}
     >
-      <canvas ref={canvasRef} className="w-full h-full" />
+      <canvas ref={canvasRef} className="w-full h-full pointer-events-none" />
 
       {/* Top-right action buttons */}
-      <div className="absolute top-4 right-4 z-10 flex items-center gap-2">
+      <div className="absolute top-4 right-4 z-10 flex items-center gap-2 pointer-events-auto"
+        onMouseDown={(e) => e.stopPropagation()}
+      >
         <EmbedButton canvasRef={exportCanvasRef} />
         <ExportButton canvasRef={exportCanvasRef} />
       </div>

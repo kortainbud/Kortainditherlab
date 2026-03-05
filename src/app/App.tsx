@@ -18,12 +18,13 @@ const defaultDitherSettings: DitherSettings = {
 };
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<Tab>('image');
+  const [activeTab, setActiveTab] = useState<Tab>('shape');
   const [image, setImage] = useState<HTMLImageElement | null>(null);
   const [shapeSource, setShapeSource] = useState<ShapeSource>({ type: 'primitive', shape: 'sphere' });
   const [extrudeScale, setExtrudeScale] = useState(50);
   const [autoRotate, setAutoRotate] = useState(true);
   const [rotationSpeed, setRotationSpeed] = useState(30);
+  const [zoom, setZoom] = useState(50);
   const [ditherSettings, setDitherSettings] = useState<DitherSettings>(defaultDitherSettings);
 
   const visualCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -110,6 +111,7 @@ export default function App() {
             extrudeScale={extrudeScale}
             autoRotate={autoRotate}
             rotationSpeed={rotationSpeed}
+            zoom={zoom}
           />
         )}
         {activeTab === 'image' && (
@@ -137,6 +139,8 @@ export default function App() {
           onAutoRotateChange={setAutoRotate}
           rotationSpeed={rotationSpeed}
           onRotationSpeedChange={setRotationSpeed}
+          zoom={zoom}
+          onZoomChange={setZoom}
         />
       </div>
 

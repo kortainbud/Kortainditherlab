@@ -19,6 +19,8 @@ interface ControlPanelProps {
   onAutoRotateChange?: (v: boolean) => void;
   rotationSpeed?: number;
   onRotationSpeedChange?: (v: number) => void;
+  zoom?: number;
+  onZoomChange?: (v: number) => void;
 }
 
 function SliderControl({
@@ -120,6 +122,8 @@ export function ControlPanel({
   onAutoRotateChange,
   rotationSpeed,
   onRotationSpeedChange,
+  zoom,
+  onZoomChange,
 }: ControlPanelProps) {
   const isCustomModel = shapeSource && shapeSource.type !== 'primitive';
 
@@ -245,13 +249,24 @@ export function ControlPanel({
             {extrudeScale !== undefined && onExtrudeScaleChange && (
               <div>
                 <SectionHeader title="Transform" />
-                <SliderControl
-                  label="Extrude"
-                  value={extrudeScale}
-                  min={1}
-                  max={100}
-                  onChange={onExtrudeScaleChange}
-                />
+                <div className="space-y-3">
+                  <SliderControl
+                    label="Extrude"
+                    value={extrudeScale}
+                    min={1}
+                    max={100}
+                    onChange={onExtrudeScaleChange}
+                  />
+                  {zoom !== undefined && onZoomChange && (
+                    <SliderControl
+                      label="Zoom"
+                      value={zoom}
+                      min={1}
+                      max={100}
+                      onChange={onZoomChange}
+                    />
+                  )}
+                </div>
               </div>
             )}
           </>
